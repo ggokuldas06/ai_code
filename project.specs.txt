@@ -1,0 +1,1370 @@
+================================================================================
+        AICODE CLI — COMPLETE TECHNICAL SPECIFICATION & ARCHITECTURE DOCUMENT
+        Version: 0.1.0  |  Author: Gokuladas Girishkumar
+        Stack: Python 3.10+, LangGraph, LangChain, OpenAI, Typer, Rich
+================================================================================
+
+This document describes every component of AICode CLI in full technical detail.
+It is intended as a reference for understanding the system architecture, agentic
+AI design patterns, and the role of every library used in the project.
+
+Reading this document top-to-bottom will give you a complete mental model of
+how the tool works — from the CLI command a user types to the AI writing and
+self-correcting production code on their machine.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+  1.  Project Overview
+  2.  Technology Stack & Dependencies
+  3.  High-Level Architecture
+  4.  What is Agentic AI?
+  5.  What is LangChain?
+  6.  What is LangGraph? (Core Concept — Deep Dive)
+  7.  The Agent Graph: Nodes, Edges, and State
+  8.  Each Agent Node — Detailed Breakdown
+        8.1  Planner Node
+        8.2  Scaffolder Node
+        8.3  Generator Node
+        8.4  Executor Node
+        8.5  Debugger Node
+  9.  Routing Logic (Conditional Edges)
+  10. Prompt Engineering — All Four Prompts Explained
+  11. LangChain Tools Layer
+  12. State Management (AgentState + state.json)
+  13. Configuration System
+  14. CLI Layer — Typer
+  15. Terminal UI — Rich
+  16. Security Architecture
+  17. Shell Execution Engine
+  18. Filesystem & Workspace Sandboxing
+  19. Diff/Patch System
+  20. Data Flow: End-to-End Trace (build command)
+  21. Data Flow: End-to-End Trace (debug command)
+  22. File-by-File Module Reference
+  23. Interview Questions & Answers
+  24. Glossary
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+
+AICode CLI is an agentic AI command-line tool that autonomously generates,
+scaffolds, and debugs software projects from a plain-English description.
+
+A user types:
+    aicode build "a Flask REST API with /health and /hello endpoints"
+
+And the system automatically:
+  - Asks an LLM to create a build plan (which files, which stack, what tests)
+  - Creates the folder structure
+  - Generates full working code for every file
+  - Installs dependencies and runs tests
+  - If tests fail, asks the LLM to diagnose the error and write a fix
+  - Repeats the fix-and-test cycle up to N times (default: 5)
+
+This is not a chatbot. The user does not guide the AI through conversation.
+The AI operates as an autonomous agent, making decisions and taking real actions
+(writing files, running shell commands) in a loop until the project is complete
+or the error cannot be resolved.
+
+Key capabilities:
+  - Build new projects from scratch (Flask, FastAPI, Express, Node.js, etc.)
+  - Debug existing projects by analyzing errors and applying code patches
+  - Run sandboxed shell commands with an allowlist/blocklist security layer
+  - Track persistent project state between sessions
+  - Display a rich, color-coded terminal UI
+
+================================================================================
+2. TECHNOLOGY STACK & DEPENDENCIES
+================================================================================
+
+Defined in pyproject.toml:
+
+  Package                  Version       Role
+  -------                  -------       ----
+  typer[all]               >=0.9.0       CLI framework (commands, arguments, options)
+  rich                     >=13.0        Terminal UI (panels, tables, colors, spinners)
+  langgraph                >=0.2.0       Agentic graph orchestration (the AI brain)
+  langchain                >=0.3.0       LLM abstraction layer (prompts, messages)
+  langchain-openai          >=0.1.0       OpenAI-specific LangChain adapter (ChatOpenAI)
+
+Python version: 3.10+ (required for union type syntax like `dict | None`)
+
+Installation method: pip install -e . (editable install)
+Entry point: aicode = "aicode.cli:app" — the `aicode` command maps to the
+             Typer `app` object defined in aicode/cli.py
+
+Environment variables (no hardcoded secrets):
+  OPENAI_API_KEY        — Required. Your OpenAI API key.
+  AICODE_MODEL          — Optional. Defaults to "gpt-4o-mini".
+  AICODE_MAX_ITERATIONS — Optional. Max debug cycles. Defaults to 5.
+  AICODE_SHELL_TIMEOUT  — Optional. Shell command timeout (seconds). Defaults to 60.
+  AICODE_WORKSPACE      — Optional. Root dir for project workspaces. Defaults to ./aicode_workspace.
+
+================================================================================
+3. HIGH-LEVEL ARCHITECTURE
+================================================================================
+
+The system is divided into three major layers:
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                     USER (terminal)                         │
+  │       aicode build "..."   /   aicode debug my-proj        │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │
+  ┌───────────────────────────▼─────────────────────────────────┐
+  │                   CLI LAYER  (cli.py)                       │
+  │   Typer-based commands: init / build / debug / run /        │
+  │   test / status                                             │
+  │   Loads config, validates API key, routes to graph          │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │
+  ┌───────────────────────────▼─────────────────────────────────┐
+  │             AGENTIC GRAPH LAYER  (graph.py)                 │
+  │                                                             │
+  │   LangGraph StateGraph with 5 nodes:                        │
+  │                                                             │
+  │   [planner] → [scaffolder] → [generator] → [executor]       │
+  │                                                  │          │
+  │                                           (if errors)       │
+  │                                                  ▼          │
+  │                                           [debugger]        │
+  │                                                  │          │
+  │                                       (loops back to        │
+  │                                        executor until       │
+  │                                        pass or max iter)    │
+  │                                                  │          │
+  │                                                 END         │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │
+  ┌───────────────────────────▼─────────────────────────────────┐
+  │           INFRASTRUCTURE LAYER (support modules)            │
+  │                                                             │
+  │   llm.py         — creates OpenAI ChatOpenAI instance       │
+  │   prompts.py     — 4 prompt templates (plan/scaffold/       │
+  │                    generate/debug)                          │
+  │   tools.py       — LangChain @tool definitions              │
+  │   shell.py       — subprocess execution with timeout        │
+  │   security.py    — command allowlist + blocked patterns      │
+  │   filesystem.py  — sandboxed file read/write/list           │
+  │   workspace.py   — path management & path traversal guard   │
+  │   diff_patch.py  — unified diff generation & patch apply    │
+  │   state.py       — JSON state persistence per project       │
+  │   config.py      — env var loading + validation             │
+  │   ui.py          — Rich terminal output helpers             │
+  └─────────────────────────────────────────────────────────────┘
+
+================================================================================
+4. WHAT IS AGENTIC AI?
+================================================================================
+
+Traditional AI use: User asks question → AI gives answer → Done.
+
+Agentic AI: The AI is given a goal and a set of tools. It plans, acts, observes
+the result, and adapts — in a loop — until the goal is achieved.
+
+Key properties of an AI agent:
+  1. Goal-directed   — The agent has an objective, not just a one-shot query.
+  2. Tool use        — The agent can call real functions (write a file, run a
+                       command, call an API).
+  3. Observation     — After taking an action, the agent receives feedback
+                       (did the tests pass? what was the error output?).
+  4. Iteration       — The agent loops: act → observe → decide → act again.
+  5. Memory/State    — The agent carries information from one step to the next.
+
+In AICode CLI:
+  - The GOAL is: "produce a working codebase from this description"
+  - The TOOLS are: write files, run shell commands, apply patches
+  - The OBSERVATION is: stdout/stderr of test commands
+  - The ITERATION is: the debugger → executor loop in LangGraph
+  - The STATE is: AgentState (the TypedDict passed between graph nodes)
+
+The key difference from a simple script is that the AI decides what code to
+write, what to fix, and what commands to run. The human does not guide it
+step-by-step.
+
+================================================================================
+5. WHAT IS LANGCHAIN?
+================================================================================
+
+LangChain is a Python (and JavaScript) framework for building applications
+powered by Large Language Models (LLMs). It provides:
+
+  a) A unified interface for calling different LLM providers
+     Instead of writing different code for OpenAI, Anthropic, Google, etc.,
+     you use a single LangChain abstraction. In this project:
+
+       from langchain_openai import ChatOpenAI
+       llm = ChatOpenAI(model="gpt-4o-mini", ...)
+       response = llm.invoke("your prompt here")
+
+  b) Message types
+     LangChain standardizes prompts as message objects:
+       - HumanMessage    → user turn
+       - AIMessage       → model response
+       - SystemMessage   → system instructions
+
+     When we call llm.invoke("text"), LangChain wraps it in a HumanMessage
+     automatically.
+
+  c) Tools (@tool decorator)
+     LangChain provides the @tool decorator to turn any Python function into
+     a callable tool that an LLM can invoke via function calling. Used in
+     tools.py (though in this project, tools are invoked directly by node
+     code, not by the LLM itself in a ReAct loop).
+
+  d) Prompt Templates
+     LangChain supports PromptTemplate and ChatPromptTemplate to structure
+     dynamic prompts. In this project, we use simple Python f-string templates
+     (PLAN_PROMPT.format(...)) for clarity, but these are compatible with
+     LangChain's template system.
+
+  e) Chains
+     LangChain allows composing steps using the pipe operator (|).
+     Example: prompt | llm | output_parser
+     This project uses direct .invoke() calls rather than chains, giving
+     explicit control over each LLM call within each graph node.
+
+LangChain version used: >=0.3.0 (modern "v0.3" API with langchain_openai adapter)
+
+================================================================================
+6. WHAT IS LANGGRAPH? (CORE CONCEPT — DEEP DIVE)
+================================================================================
+
+LangGraph is a library built on top of LangChain that lets you build stateful,
+multi-step agent workflows as directed graphs.
+
+---------- WHY NOT JUST USE A FOR LOOP? ----------
+
+You could, in theory, implement the plan→scaffold→generate→execute→debug
+pipeline as a simple Python for loop or chain of function calls. But LangGraph
+provides:
+
+  1. Explicit State Management
+     Every node receives the full shared state and returns only the keys it
+     updates. The graph merges updates automatically. This makes it easy to
+     reason about what data exists at any point in the workflow.
+
+  2. Conditional Routing
+     Edges between nodes can be conditional (dynamic). After the executor runs,
+     the next node is decided by a routing function based on the state —
+     either "debugger" (if there are errors) or END (if all passed).
+
+  3. Cycles / Loops
+     LangGraph supports cycles in the graph, which is essential for the
+     debug→execute→debug loop. A regular chain/pipeline cannot loop back.
+
+  4. Observability
+     Because the graph structure is explicit, it's easy to trace, log, and
+     visualize which nodes ran in what order and what state changes occurred.
+
+  5. Checkpointing (future-ready)
+     LangGraph supports saving graph state to disk between steps (using
+     checkpointers). This allows long-running agents to be paused and resumed.
+
+---------- HOW LANGGRAPH WORKS ----------
+
+Step 1: Define a State schema
+  A TypedDict (or Pydantic model) that represents all shared data.
+  Every node reads from and writes to this state.
+
+  In this project (graph.py):
+    class AgentState(TypedDict, total=False):
+        config: dict          # LLM config (api key, model name, etc.)
+        workspace: str        # Path to the project workspace
+        description: str      # The user's project description
+        plan: dict            # The build plan generated by the planner
+        files: dict[str,str]  # File path → file content map
+        current_step: str     # Controls routing: "scaffold","generate", etc.
+        command_output: str   # stdout/stderr from the last shell command
+        errors: list[str]     # Accumulated error messages
+        iteration: int        # Current debug loop iteration count
+        max_iterations: int   # Maximum allowed debug iterations
+        state_data: dict      # Persistent state (written to state.json)
+        status: str           # "running", "completed", "failed", etc.
+
+Step 2: Define Nodes
+  A node is a Python function:
+    - Input:  the full AgentState
+    - Output: a dict with only the keys that changed
+  LangGraph merges this partial dict back into the state.
+
+  Example node signature:
+    def planner_node(state: AgentState) -> dict:
+        ...
+        return {"plan": plan, "current_step": "scaffold", "iteration": 0}
+
+Step 3: Define Edges
+  Edges tell LangGraph what runs after each node.
+
+  Two types:
+    a) Static edge: always go to the same next node
+         graph.add_edge("planner", "scaffolder")
+
+    b) Conditional edge: a routing function decides the next node
+         graph.add_conditional_edges("executor", route_next)
+
+       route_next is a function that takes the state and returns a node name
+       (or END). This is how the system decides: "did tests pass? → END" or
+       "did tests fail? → debugger".
+
+Step 4: Set entry point
+    graph.set_entry_point("planner")
+
+Step 5: Compile and invoke
+    compiled_graph = graph.compile()
+    result = compiled_graph.invoke(initial_state)
+
+  .invoke() runs the graph synchronously from entry point to END and returns
+  the final state.
+
+---------- ROUTING FUNCTION ----------
+
+def route_next(state: AgentState) -> str:
+    step = state.get("current_step", "done")
+    if step == "scaffold":   return "scaffolder"
+    elif step == "generate": return "generator"
+    elif step == "execute":  return "executor"
+    elif step == "debug":    return "debugger"
+    else:                    return END
+
+This single function is attached to ALL five nodes as a conditional edge.
+After every node runs, this function is called to determine what runs next.
+The current_step field in the state acts as a "next instruction pointer".
+
+---------- THE LOOP ----------
+
+The graph allows cycles. The debugger sets current_step = "execute", which
+routes back to the executor. The executor either:
+  - Succeeds → sets current_step = "done" → routes to END
+  - Fails again → sets current_step = "debug" → routes to debugger
+  - Hits max iterations → debugger returns current_step = "done"
+
+This is a stateful loop, not a recursive call. LangGraph tracks the state
+across each pass through the cycle.
+
+================================================================================
+7. THE AGENT GRAPH — NODES, EDGES, AND STATE (VISUAL)
+================================================================================
+
+  Initial State: {description, workspace, config, current_step="plan", ...}
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │    PLANNER      │  node: planner_node()
+                    │   (LLM call)    │  LLM generates JSON build plan
+                    └────────┬────────┘
+                             │ current_step = "scaffold"
+                             ▼
+                    ┌─────────────────┐
+                    │   SCAFFOLDER    │  node: scaffolder_node()
+                    │   (LLM call)    │  Creates dirs + file stubs
+                    └────────┬────────┘
+                             │ current_step = "generate"
+                             ▼
+                    ┌─────────────────┐
+                    │   GENERATOR     │  node: generator_node()
+                    │   (LLM calls)   │  Writes full implementation per file
+                    └────────┬────────┘
+                             │ current_step = "execute"
+                             ▼
+                    ┌─────────────────┐
+                    │    EXECUTOR     │  node: executor_node()
+                    │  (shell cmds)   │  pip install, run tests, run app
+                    └────────┬────────┘
+                             │
+               ┌─────────────┴──────────────┐
+         errors?                        no errors
+               │                            │
+               ▼                            ▼
+      ┌─────────────────┐              current_step = "done"
+      │    DEBUGGER     │                   │
+      │   (LLM call)    │                   ▼
+      │ Analyzes error, │                  END
+      │ writes fix,     │
+      │ runs extra cmds │
+      └────────┬────────┘
+               │ current_step = "execute" (loop back)
+               │ (or "done" if max_iterations reached)
+               └──────────────► [EXECUTOR again...]
+
+All edges are conditional (add_conditional_edges with route_next function).
+
+================================================================================
+8. EACH AGENT NODE — DETAILED BREAKDOWN
+================================================================================
+
+------------------------------------------------------------
+8.1  PLANNER NODE  (planner_node)
+------------------------------------------------------------
+
+File:    graph.py, line 45
+Purpose: Transform the user's natural-language description into a structured
+         JSON build plan that all subsequent nodes use.
+
+How it works:
+  1. Reconstructs AICodeConfig from the serialized config dict in state
+     (the config is stored as a plain dict so LangGraph can serialize state).
+  2. Creates the LLM instance via create_llm(config).
+  3. Formats PLAN_PROMPT with the user's description.
+  4. Calls llm.invoke(prompt) — a single synchronous API call to OpenAI.
+  5. Parses the JSON response (handles markdown code fences from the LLM).
+  6. Returns the plan dict and sets current_step = "scaffold".
+
+What the LLM returns (JSON):
+  {
+    "project_name": "todo-api",
+    "stack": "python",
+    "steps": [
+      {"step": 1, "description": "Create Flask app", "files": ["app.py"]},
+      {"step": 2, "description": "Create models", "files": ["models.py"]},
+      ...
+    ],
+    "folder_structure": ["app.py", "models.py", "requirements.txt", "tests/"],
+    "test_command": "pytest",
+    "run_command": "python app.py"
+  }
+
+State update returned:
+  {"plan": <plan dict>, "current_step": "scaffold", "iteration": 0}
+
+Potential failure mode: If the LLM returns invalid JSON or wraps in markdown,
+_parse_json_response() strips the fences and retries json.loads().
+
+------------------------------------------------------------
+8.2  SCAFFOLDER NODE  (scaffolder_node)
+------------------------------------------------------------
+
+File:    graph.py, line 59
+Purpose: Create the physical folder structure on disk and generate initial
+         file stubs (placeholder content) for all files in the plan.
+
+How it works:
+  1. Reads the plan from state.
+  2. Iterates folder_structure entries. If an entry ends with "/" it's a
+     directory → calls create_directory(). If it's a file, ensures parent
+     dir exists.
+  3. Makes a second LLM call with SCAFFOLD_PROMPT, asking the LLM to produce
+     initial content for every file in the plan.
+  4. The LLM returns JSON: {"files": {"app.py": "# placeholder...", ...}}
+  5. Each file is written to disk via write_file() and stored in the files
+     dict in state.
+  6. Sets current_step = "generate".
+
+Why two LLM calls (planner + scaffolder)?
+  Separation of concerns. The planner thinks about WHAT to build (architecture).
+  The scaffolder thinks about file structure layout and stubs. Keeping them
+  separate produces cleaner, more focused outputs than asking one prompt to
+  do both.
+
+State update returned:
+  {"files": {<file_path>: <content>, ...}, "current_step": "generate"}
+
+------------------------------------------------------------
+8.3  GENERATOR NODE  (generator_node)
+------------------------------------------------------------
+
+File:    graph.py, line 94
+Purpose: Write complete, production-ready implementation code for every file,
+         one file at a time, with full awareness of the other files.
+
+How it works:
+  1. Iterates over plan["steps"], and for each step, iterates its files list.
+  2. For each file, constructs GENERATE_PROMPT with:
+       - The full plan (as JSON context)
+       - The specific file path to generate
+       - The step's purpose/description
+       - A summary of other files already in state (first 500 chars each)
+         so the LLM can write compatible code (shared imports, consistent models)
+  3. Calls llm.invoke(prompt) for each file.
+  4. Strips markdown fences from the response (the LLM sometimes adds ```python).
+  5. Applies the content to disk via apply_patch_to_file() which also generates
+     a unified diff (used to display a change summary in the terminal).
+  6. Updates files dict with the new content.
+
+Why per-file generation instead of all-at-once?
+  LLMs produce better code when focused on one file at a time. Providing
+  other_files as context lets the generator be consistent (same models, same
+  imports, same API shapes) without being overwhelmed by a huge multi-file
+  prompt.
+
+State update returned:
+  {"files": {<all files with full content>}, "current_step": "execute"}
+
+------------------------------------------------------------
+8.4  EXECUTOR NODE  (executor_node)
+------------------------------------------------------------
+
+File:    graph.py, line 137
+Purpose: Install dependencies and run the generated code/tests to verify
+         correctness. This is the "observation" step in the agent loop.
+
+How it works:
+  1. Detects stack from plan["stack"] ("python" or "node").
+  2. If Python:
+       - Checks if requirements.txt exists
+       - Runs: pip install -r requirements.txt
+       - Records result in state_data["command_history"]
+  3. If Node:
+       - Checks if package.json exists
+       - Runs: npm install
+  4. Runs plan["test_command"] (e.g., "pytest")
+       - If this fails, captures the error output.
+  5. Runs plan["run_command"] with a SHORT timeout (10 seconds)
+       - This is a quick smoke test. If a server starts, we let it time out
+         (timed_out = True is not counted as an error).
+  6. Decision:
+       - If any errors → returns current_step = "debug"
+       - If no errors → returns current_step = "done", status = "completed"
+
+This is the ONLY node that does not call the LLM. It runs real shell commands.
+
+Shell execution goes through shell.py → security.py first:
+  - Blocked patterns are checked (no rm -rf /, no sudo, no curl | bash, etc.)
+  - Base command is checked against ALLOWED_COMMANDS allowlist
+  - Subprocess runs with timeout via subprocess.run(..., timeout=timeout)
+
+State update returned (success):
+  {"command_output": "All commands executed successfully",
+   "errors": [], "current_step": "done", "status": "completed", ...}
+
+State update returned (failure):
+  {"command_output": "<stderr output>",
+   "errors": ["<stderr>"], "current_step": "debug", ...}
+
+------------------------------------------------------------
+8.5  DEBUGGER NODE  (debugger_node)
+------------------------------------------------------------
+
+File:    graph.py, line 205
+Purpose: Analyze the error from the executor, generate a fix (patched files),
+         apply it to disk, and hand control back to the executor for re-testing.
+
+How it works:
+  1. Increments iteration counter. If iteration > max_iterations, returns
+     current_step = "done" with status = "max_iterations_reached".
+  2. Collects all current file contents from disk (files dict).
+  3. Collects previous error attempts from state_data["errors"] to avoid
+     the LLM making the same fix twice.
+  4. Constructs DEBUG_PROMPT with:
+       - All file contents (so the LLM can see the full codebase)
+       - The command that failed and its exit code
+       - The full error output (stderr/stdout)
+       - Any previous fix attempts (to prevent repetition)
+  5. Calls llm.invoke(prompt).
+  6. Parses the JSON fix response:
+       {
+         "root_cause": "Missing flask import in app.py",
+         "fixes": [{"file": "app.py", "content": "...corrected code..."}],
+         "additional_commands": ["pip install flask"]
+       }
+  7. Applies each fix via apply_patch_to_file() — writes to disk, logs diff.
+  8. Runs any additional_commands (e.g., pip install a missing package).
+  9. Records the error root_cause in state_data via add_error().
+  10. Returns current_step = "execute" — hands back to executor for re-testing.
+
+The debugger does NOT re-run the tests itself. It always delegates back to
+the executor node. This keeps responsibilities separated and the loop clean.
+
+State update returned:
+  {"files": {<updated files>}, "current_step": "execute",
+   "iteration": <n+1>, "state_data": <updated>}
+
+================================================================================
+9. ROUTING LOGIC (CONDITIONAL EDGES)
+================================================================================
+
+File: graph.py, line 270
+
+def route_next(state: AgentState) -> str:
+    step = state.get("current_step", "done")
+    if step == "scaffold":   return "scaffolder"
+    elif step == "generate": return "generator"
+    elif step == "execute":  return "executor"
+    elif step == "debug":    return "debugger"
+    else:                    return END
+
+This function is registered as the routing function for EVERY node:
+
+    graph.add_conditional_edges("planner",    route_next)
+    graph.add_conditional_edges("scaffolder", route_next)
+    graph.add_conditional_edges("generator",  route_next)
+    graph.add_conditional_edges("executor",   route_next)
+    graph.add_conditional_edges("debugger",   route_next)
+
+The current_step field is the "control flow register" of the agent. Any node
+can transition to any other node by setting current_step. This makes the graph
+very flexible — for example, if in the future you want the planner to re-plan
+after debugging, you can set current_step = "scaffold" from the debugger.
+
+================================================================================
+10. PROMPT ENGINEERING — ALL FOUR PROMPTS EXPLAINED
+================================================================================
+
+File: prompts.py
+
+All prompts use the technique of "structured output prompting" — instructing
+the LLM to return a specific JSON schema. This is critical for agentic systems
+because the code needs to parse the response programmatically.
+
+------------------------------------------------------------
+PLAN_PROMPT
+------------------------------------------------------------
+Technique: Zero-shot instruction with explicit JSON schema
+Goal:      Get the LLM to act as a software architect
+
+Key design decisions:
+  - "Keep the plan minimal and focused on an MVP" — prevents over-engineering
+  - Explicit schema with examples for every field type
+  - "Respond ONLY with the JSON object, no markdown fences" — prevents
+    parsing failures (though _parse_json_response handles fences as fallback)
+  - The schema includes both folder_structure (for scaffolding) and steps
+    (for generation), providing two different views of the same plan
+
+------------------------------------------------------------
+SCAFFOLD_PROMPT
+------------------------------------------------------------
+Technique: Context injection (the full plan is injected as JSON)
+Goal:      Produce initial file stubs that match the architecture
+
+The full plan (including steps, stack, test_command) is serialized to JSON
+and injected into the prompt. This gives the LLM rich context to decide what
+imports, class names, and structure to use in stubs.
+
+------------------------------------------------------------
+GENERATE_PROMPT
+------------------------------------------------------------
+Technique: Few-file context window with purpose-specific targeting
+Goal:      Write production-quality code for a single file
+
+Key design decisions:
+  - file_path tells the LLM exactly which file it's generating
+  - purpose tells it what this file's responsibility is
+  - other_files provides a 500-char preview of sibling files — enough to
+    understand API shapes and imports without exceeding token limits
+  - "Write the complete, working code... production-ready and functional"
+    sets the quality bar explicitly
+  - Responds with raw code (no JSON) because code embedded in JSON causes
+    escaping issues
+
+------------------------------------------------------------
+DEBUG_PROMPT
+------------------------------------------------------------
+Technique: Error-context injection with anti-repetition mechanism
+Goal:      Root-cause analysis + targeted code fix
+
+Key design decisions:
+  - Full file contents are injected (not just the failing file) because the
+    bug may be in an import chain, a config file, or a dependency mismatch
+  - The command, exit code, and error output are all provided — the LLM needs
+    all three to accurately diagnose (e.g., exit code 1 vs 127 has different
+    meanings)
+  - previous_attempts lists prior root causes. This tells the LLM "you already
+    tried X, try something different." Without this, the LLM often proposes
+    the same fix repeatedly.
+  - additional_commands field allows the LLM to request package installs —
+    critical for "ModuleNotFoundError: No module named 'flask'" type errors
+
+================================================================================
+11. LANGCHAIN TOOLS LAYER
+================================================================================
+
+File: tools.py
+
+LangChain's @tool decorator wraps Python functions so they can be described
+to an LLM and called by it. Each tool has a docstring that becomes its
+description in the LLM's tool catalog.
+
+Tools defined:
+
+  run_shell_command(command: str) -> str
+    Runs a shell command in the project workspace.
+    Internally calls shell.run_command() which applies security checks.
+
+  write_project_file(file_path: str, content: str) -> str
+    Writes a file to the workspace.
+    Calls filesystem.write_file() which validates path via workspace.py.
+
+  read_project_file(file_path: str) -> str
+    Reads a file from the workspace.
+
+  list_project_files(directory: str = ".") -> str
+    Lists all files in the workspace.
+
+  create_project_directory(dir_path: str) -> str
+    Creates a directory in the workspace.
+
+  apply_file_patch(file_path: str, new_content: str) -> str
+    Replaces file content and returns the unified diff.
+
+ALL_TOOLS = [all six tools above]
+
+Workspace binding:
+  The tools use a module-level _workspace variable. set_workspace(path) must
+  be called before any tool is used. The graph nodes call workspace operations
+  directly (not through these tools) but the tools are available if you want
+  to bind the LLM to an agent that autonomously calls them (e.g., a ReAct agent).
+
+Note: In the current architecture, the graph nodes call the underlying
+filesystem/shell functions directly. The tools.py module provides a LangChain-
+compatible interface for future use with tool-calling LLMs.
+
+================================================================================
+12. STATE MANAGEMENT
+================================================================================
+
+There are two distinct state systems:
+
+------------------------------------------------------------
+A) AgentState (in-memory, per graph run)
+------------------------------------------------------------
+
+TypedDict defined in graph.py. Lives only for the duration of a graph.invoke()
+call. Contains everything the agent nodes share:
+  - config: serialized AICodeConfig (as plain dict for JSON compatibility)
+  - workspace: absolute path string to the project directory
+  - description: the user's original build request
+  - plan: the JSON plan from the planner
+  - files: map of relative_file_path → file_content (in memory + on disk)
+  - current_step: routing control field
+  - command_output: stdout/stderr from last shell execution
+  - errors: list of error strings from executor
+  - iteration: debug loop counter
+  - max_iterations: ceiling for debug loop
+  - state_data: a nested dict that maps to state.json (the persistent layer)
+  - status: "running" | "completed" | "failed" | "max_iterations_reached"
+
+------------------------------------------------------------
+B) state.json (persistent, per project)
+------------------------------------------------------------
+
+File: state.py
+Path: <workspace>/.aicode/state.json
+
+Written to disk by cli.py (via save_state) after the graph completes.
+Contains:
+  - project_name
+  - status
+  - plan (the last build plan)
+  - current_step (as an integer index, used for display)
+  - files_created (list of file paths)
+  - command_history (list of {command, exit_code, output, timestamp})
+  - errors (list of {error, context, timestamp})
+  - patches (list of {file, diff, timestamp})
+  - iteration
+  - created_at / updated_at (ISO 8601 UTC timestamps)
+
+This is what `aicode status my-project` reads to display project info.
+It's also used by `aicode debug` to retrieve the last error without needing
+to re-run a command.
+
+Helper functions in state.py:
+  init_state(workspace, project_name) → creates fresh state, writes to disk
+  load_state(workspace)               → reads state.json from disk
+  save_state(workspace, state)        → writes state dict to disk (updates updated_at)
+  add_command_history(state, ...)     → appends to command_history list
+  add_error(state, error, context)    → appends to errors list (capped at 2000 chars)
+  add_patch(state, file_path, diff)   → appends to patches list
+
+================================================================================
+13. CONFIGURATION SYSTEM
+================================================================================
+
+File: config.py
+
+@dataclass
+class AICodeConfig:
+    openai_api_key: str = ""
+    model_name: str = "gpt-4o-mini"
+    max_iterations: int = 5
+    shell_timeout: int = 60
+    workspace_root: str = "./aicode_workspace"
+
+    @classmethod
+    def load(cls) -> "AICodeConfig":
+        return cls(
+            openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
+            model_name=os.environ.get("AICODE_MODEL", "gpt-4o-mini"),
+            max_iterations=int(os.environ.get("AICODE_MAX_ITERATIONS", "5")),
+            shell_timeout=int(os.environ.get("AICODE_SHELL_TIMEOUT", "60")),
+            workspace_root=os.environ.get("AICODE_WORKSPACE", "./aicode_workspace"),
+        )
+
+    def validate(self) -> list[str]:
+        errors = []
+        if not self.openai_api_key:
+            errors.append("OPENAI_API_KEY environment variable is not set")
+        if self.max_iterations < 1:
+            errors.append("max_iterations must be >= 1")
+        return errors
+
+Key design decisions:
+  - Python dataclass for type safety and field defaults.
+  - load() is a classmethod factory that reads from os.environ — never hardcoded values.
+  - validate() returns a list of errors (not raises) so the CLI can display
+    all errors at once before exiting.
+  - The config is stored inside AgentState as a plain dict (not a dataclass)
+    because LangGraph must serialize state to JSON for checkpointing. The graph
+    nodes reconstruct the dataclass with AICodeConfig(**state["config"]).
+
+Default model: "gpt-4o-mini"
+  Chosen because it is fast and cheap, suitable for code generation tasks.
+  Users can override with AICODE_MODEL=gpt-4o (more capable) or any other
+  OpenAI chat model.
+
+================================================================================
+14. CLI LAYER — TYPER
+================================================================================
+
+File: cli.py
+
+Typer is a Python CLI framework built on top of Click. It uses Python type
+annotations to automatically generate argument parsers, help text, and
+completions. No boilerplate argparse code is needed.
+
+app = typer.Typer(name="aicode", ...)
+
+Commands defined:
+
+  aicode init <project_name>
+    - Creates workspace directory
+    - Writes a fresh state.json
+    - Does NOT require API key (no LLM calls)
+
+  aicode build <description> [--name <project_name>]
+    - Calls _get_config() → validates OPENAI_API_KEY
+    - Creates workspace and initial state
+    - Calls graph.run_build_agent() — runs the full LangGraph pipeline
+    - Saves final state to state.json
+    - Displays status table (Rich)
+
+  aicode debug <project_name> [--command <cmd>]
+    - If --command provided: runs it to capture fresh error output
+    - If not: reads last error from state.json
+    - Collects all current files from workspace
+    - Calls graph.run_debug_agent() — starts graph at the debugger node
+    - Saves final state
+
+  aicode run <project_name> <command>
+    - Validates command against security.is_command_safe()
+    - Runs command in workspace via shell.run_command()
+    - Prints stdout/stderr
+    - Exits with the command's exit code
+
+  aicode test <project_name>
+    - Auto-detects test framework: checks for pytest.ini, tests/ dir, package.json
+    - Runs the detected test command
+    - Reports pass/fail
+
+  aicode status <project_name>
+    - Reads state.json
+    - Displays Rich status table and plan table
+    - Lists all project files
+
+_get_config() helper:
+  Loads config and calls validate(). If there are validation errors, prints each
+  one with print_error() and calls raise typer.Exit(1).
+
+How Typer works:
+  @app.command() decorates a function → becomes a CLI subcommand
+  Function parameters with type annotations → CLI arguments/options
+  typer.Argument(...) → positional argument (required)
+  typer.Option(None, "--name", "-n") → optional flag with default
+  typer.Exit(code) → exit with given code (like sys.exit)
+  typer.confirm("message") → interactive yes/no prompt
+
+================================================================================
+15. TERMINAL UI — RICH
+================================================================================
+
+File: ui.py
+
+Rich is a Python library for beautiful terminal output. It supports markup,
+tables, panels, syntax highlighting, progress bars, and spinners.
+
+console = Console()
+  The central Rich console object. All output goes through this.
+  Rich handles ANSI color codes, width detection, and markup parsing.
+
+print_banner()
+  Renders an ASCII panel with the app name and version using:
+    Panel(text, subtitle=..., box=box.DOUBLE)
+  The box.DOUBLE style draws double-line borders.
+
+print_step(phase, message)
+  Renders: "  [Planning] Generating project plan..."
+  Uses Rich markup: [bold blue] for the phase tag.
+
+print_success(message) → [bold green][OK] message
+print_error(message)   → [bold red][ERROR] message
+print_warning(message) → [bold yellow][WARN] message
+print_diff(file, summary) → [bold magenta][PATCH] file: +N / -M lines changed
+
+print_status_table(state)
+  Builds a Rich Table with ROUNDED box style:
+  Columns: "Field" (bold cyan) and "Value"
+  Rows: Project, Status, Current Step, Iteration, Files Created,
+        Commands Run, Errors, Patches Applied, Updated
+
+print_plan_table(plan)
+  Builds a Rich Table showing the build plan steps:
+  Columns: #, Step description, Files involved
+
+spinner(message)
+  Returns a console.status() context manager with a dots spinner animation.
+  Usage: with spinner("Loading..."): do_work()
+
+Why Rich instead of print()?
+  1. Color makes it immediately obvious what's an error vs a success.
+  2. Tables make structured data readable (status command).
+  3. Spinners signal that the LLM call is in progress (can take 5-30 seconds).
+  4. Markup is safe — Rich won't accidentally print ANSI codes to a file if
+     stdout is redirected (it detects TTY automatically).
+
+================================================================================
+16. SECURITY ARCHITECTURE
+================================================================================
+
+File: security.py
+
+The tool can execute arbitrary shell commands as directed by an LLM. This is
+dangerous if not constrained. Two layers of protection are implemented:
+
+Layer 1: BLOCKED_PATTERNS (blocklist — substring match)
+  Checked FIRST. If any of these strings appear anywhere in the command, it
+  is rejected immediately:
+    "rm -rf /"    — recursive delete from root
+    "rm -rf ~"    — recursive delete of home directory
+    "sudo "       — privilege escalation
+    "curl | bash" — remote code execution
+    "curl | sh"   — remote code execution
+    "wget | bash" — remote code execution
+    "shutdown"    — system shutdown
+    "reboot"      — system reboot
+    "mkfs"        — filesystem formatting
+    "dd if="      — disk write (can destroy disk)
+    ":(){"        — fork bomb
+    "> /dev/sd"   — direct disk write
+    "chmod 777 /" — world-writable root
+    "chown root"  — change ownership to root
+    "passwd"      — password modification
+    "visudo"      — sudoers modification
+
+Layer 2: ALLOWED_COMMANDS (allowlist — base command match)
+  After blocklist check, the command is parsed with shlex.split() (handles
+  quotes, escaping correctly). The first token (the base command, stripped
+  of any path prefix) must be in the allowlist:
+
+  python, python3, pip, pip3, node, npm, npx, pytest, unittest,
+  mkdir, ls, cat, echo, touch, cp, mv, git, cd, pwd, which, env,
+  flask, uvicorn, gunicorn, tsc, eslint, prettier
+
+is_command_safe(command) returns:
+  (True, "OK")                — command is safe to run
+  (False, "reason string")    — command is blocked, reason explains why
+
+Used in:
+  - shell.py: run_command() calls is_command_safe() before subprocess.run()
+  - cli.py:   the `run` command also calls is_command_safe() explicitly
+
+================================================================================
+17. SHELL EXECUTION ENGINE
+================================================================================
+
+File: shell.py
+
+@dataclass
+class ShellResult:
+    command: str
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+
+    @property
+    def success(self) -> bool:
+        return self.exit_code == 0
+
+    @property
+    def output(self) -> str:
+        # combines stdout + stderr into single string
+
+def run_command(command, cwd=None, timeout=60, check_safety=True):
+  1. Optionally calls is_command_safe() (check_safety=True by default)
+  2. Uses subprocess.run() with:
+       shell=True         — runs command via /bin/sh (supports pipes, &&, etc.)
+       capture_output=True — captures stdout and stderr separately
+       text=True          — returns strings, not bytes
+       timeout=<seconds>  — kills process if it exceeds timeout
+  3. Returns ShellResult with all fields populated.
+  4. On TimeoutExpired: returns ShellResult with timed_out=True, exit_code=-1
+  5. On any other Exception: returns ShellResult with the exception message in stderr
+
+The executor node uses timeout=10 for the run_command check (smoke test) so
+that server processes (like "python app.py") don't block the agent indefinitely.
+A timed_out=True result is NOT treated as an error for run commands.
+
+================================================================================
+18. FILESYSTEM & WORKSPACE SANDBOXING
+================================================================================
+
+File: workspace.py + filesystem.py
+
+Workspace path management (workspace.py):
+
+  get_workspace_path(root, project_name) → Path
+    Returns: Path(root).resolve() / project_name
+    Example: "/Users/user/code/aicodew/aicode_workspace/my-project"
+
+  create_workspace(root, project_name) → Path
+    Creates the directory with parents, exist_ok=True.
+
+  validate_path_in_workspace(workspace, target) → Path
+    CRITICAL security function. Prevents path traversal attacks.
+    Resolves (workspace / target) fully (handles ../ sequences).
+    Checks: if not resolved_path.startswith(workspace_resolved):
+                raise ValueError(...)
+    Example attack blocked:
+      target = "../../etc/passwd"
+      resolved = /etc/passwd  → does not start with workspace → ValueError
+
+  workspace_exists(root, project_name) → bool
+
+File operations (filesystem.py):
+
+  All functions call validate_path_in_workspace() first.
+  This means NO file operation can touch anything outside the project directory.
+
+  create_directory(workspace, dir_path) → mkdir with parents, exist_ok=True
+  write_file(workspace, file_path, content) → creates parents, writes text
+  read_file(workspace, file_path) → reads text (raises FileNotFoundError if missing)
+  list_files(workspace, dir_path=".") → rglob("*"), returns relative paths, sorted
+  file_exists(workspace, file_path) → bool
+
+================================================================================
+19. DIFF / PATCH SYSTEM
+================================================================================
+
+File: diff_patch.py
+
+Uses Python's built-in difflib module (no external dependencies).
+
+generate_diff(old_content, new_content, file_path) → str
+  Produces a unified diff in standard format:
+    --- a/app.py
+    +++ b/app.py
+    @@ -1,5 +1,7 @@
+     from flask import Flask
+    +from flask import jsonify
+     app = Flask(__name__)
+    ...
+
+apply_patch_to_file(workspace, file_path, new_content) → diff_str
+  1. Validates path is inside workspace (security).
+  2. Reads existing file content (empty string if file doesn't exist yet).
+  3. Generates unified diff between old and new content.
+  4. Writes new_content to disk.
+  5. Returns the diff string (for display + logging).
+
+apply_patch_to_content(original, new_content) → (new_content, diff)
+  In-memory version (no disk write).
+
+show_diff_summary(diff) → str
+  Counts lines starting with "+" (additions) and "-" (deletions).
+  Returns: "+12 / -3 lines changed"
+  Displayed in terminal after every file generation.
+
+================================================================================
+20. DATA FLOW: END-TO-END TRACE (build command)
+================================================================================
+
+User runs: aicode build "a Flask REST API with /health and /hello endpoints"
+
+Step 1: cli.py — build()
+  - Typer parses "a Flask REST API..." as description argument
+  - _get_config() loads AICodeConfig from env vars, validates OPENAI_API_KEY
+  - project_name auto-generated: "a-flask-rest-api-with-health-a" (30 chars, slugified)
+  - create_workspace("./aicode_workspace", project_name) → creates directory
+  - init_state(ws, project_name) → writes .aicode/state.json with status="initialized"
+  - graph.run_build_agent(workspace, description, config, state_data) called
+
+Step 2: graph.py — run_build_agent()
+  - Builds initial AgentState with current_step="plan"
+  - graph.compile().invoke(initial_state) — enters the graph
+
+Step 3: LangGraph — planner_node()
+  - llm.invoke(PLAN_PROMPT.format(description=...))
+  - OpenAI API call → returns JSON build plan
+  - state["plan"] = parsed plan dict
+  - state["current_step"] = "scaffold"
+  - route_next() → returns "scaffolder"
+
+Step 4: LangGraph — scaffolder_node()
+  - Creates directories on disk
+  - llm.invoke(SCAFFOLD_PROMPT.format(plan=...))
+  - OpenAI API call → returns {"files": {"app.py": "...", ...}}
+  - Each file written to disk via write_file()
+  - state["files"] = file dict
+  - state["current_step"] = "generate"
+  - route_next() → returns "generator"
+
+Step 5: LangGraph — generator_node()
+  - For each step in plan["steps"]:
+    For each file in step["files"]:
+      - llm.invoke(GENERATE_PROMPT.format(...))
+      - OpenAI API call → returns raw code string
+      - apply_patch_to_file(workspace, file_path, code) → writes to disk
+      - print_diff() shows "+N / -M lines changed"
+  - state["current_step"] = "execute"
+  - route_next() → returns "executor"
+
+Step 6: LangGraph — executor_node()
+  - run_command("pip install -r requirements.txt") → ShellResult
+  - run_command("pytest") → ShellResult
+  - run_command("python app.py", timeout=10) → ShellResult (times out, OK)
+  Scenario A — all pass:
+    - state["current_step"] = "done", state["status"] = "completed"
+    - route_next() → returns END
+  Scenario B — pytest fails:
+    - state["errors"] = ["FAILED test_app.py::test_health - AssertionError"]
+    - state["current_step"] = "debug"
+    - route_next() → returns "debugger"
+
+Step 7 (if errors): LangGraph — debugger_node()
+  - llm.invoke(DEBUG_PROMPT.format(files=..., error_output=...))
+  - OpenAI API call → returns {"root_cause": "...", "fixes": [...]}
+  - apply_patch_to_file() for each fix
+  - run any additional_commands (pip install, etc.)
+  - state["current_step"] = "execute", state["iteration"] += 1
+  - route_next() → returns "executor"
+  → Back to Step 6. Loops until pass or max_iterations reached.
+
+Step 8: graph.invoke() returns final state dict
+
+Step 9: cli.py — back in build()
+  - state["status"] updated from result
+  - state["files_created"] updated
+  - save_state(ws, state) → writes final state.json
+  - print_success("Build completed!")
+  - print_status_table(state) → displays Rich table
+
+================================================================================
+21. DATA FLOW: END-TO-END TRACE (debug command)
+================================================================================
+
+User runs: aicode debug my-project --command "pytest"
+
+Step 1: cli.py — debug()
+  - _get_config() validates config
+  - get_workspace_path() finds the workspace
+  - load_state(ws) reads state.json
+  - run_command("pytest", cwd=ws) → captures error output
+  - If command succeeds → "Nothing to debug!" → exit 0
+  - If command fails → error_output = result.output
+  - list_files(ws) + read_file() for all non-.aicode/ files
+  - run_debug_agent(workspace, error_output, config, state_data, files)
+
+Step 2: graph.py — run_debug_agent()
+  - Builds initial AgentState with:
+      current_step = "debug"  ← starts at debugger, skips planner/scaffolder/generator
+      command_output = error_output
+      files = all current file contents
+  - graph.compile().invoke(initial_state)
+
+Step 3: route_next() immediately routes to "debugger" (skipping first 3 nodes)
+
+Step 4: debugger_node() → same as Step 7 above
+
+Step 5: executor_node() re-runs tests → same as Step 6
+
+Step 6: Loops until fixed or max_iterations reached.
+
+================================================================================
+22. FILE-BY-FILE MODULE REFERENCE
+================================================================================
+
+  File                  Lines  Responsibility
+  ----                  -----  --------------
+  pyproject.toml          22   Package metadata, dependencies, entry point
+  aicode/__init__.py       0   Package marker (empty)
+  aicode/cli.py          285   Typer CLI: 6 commands, config validation, graph calls
+  aicode/config.py         32   AICodeConfig dataclass, env var loading, validation
+  aicode/graph.py         374   LangGraph StateGraph: 5 nodes, routing, 2 entry fns
+  aicode/llm.py            16   create_llm() factory: returns ChatOpenAI instance
+  aicode/prompts.py        83   4 prompt templates: PLAN, SCAFFOLD, GENERATE, DEBUG
+  aicode/tools.py          79   6 LangChain @tool definitions (shell, files, dirs)
+  aicode/state.py          79   state.json CRUD + add_command_history/error/patch
+  aicode/workspace.py      28   Path management, path traversal guard
+  aicode/filesystem.py     42   Sandboxed file/dir operations using workspace.py
+  aicode/shell.py          79   subprocess.run wrapper: timeout, safety check, result
+  aicode/security.py       62   ALLOWED_COMMANDS allowlist, BLOCKED_PATTERNS blocklist
+  aicode/diff_patch.py     54   difflib unified diff generation and patch application
+  aicode/ui.py             75   Rich console: banner, step/success/error/table helpers
+
+================================================================================
+23. INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+Q: What is AICode CLI and what problem does it solve?
+A: AICode CLI is an agentic AI tool that automatically builds and debugs software
+   projects from a natural-language description. The problem it solves is the time
+   and effort required to scaffold, write, test, and debug boilerplate code. Instead
+   of a developer writing starter code, the AI does it autonomously and self-corrects
+   when tests fail.
+
+Q: What is an AI agent, and how does this project implement one?
+A: An AI agent is a system that uses an LLM to perceive its environment, reason
+   about a goal, take actions using tools, and iterate based on feedback. In this
+   project, the agent's goal is "build a working project." Its tools are: writing
+   files, running shell commands, and applying patches. Its feedback loop is the
+   stdout/stderr from test commands. It iterates in a plan→scaffold→generate→test→
+   debug cycle until the tests pass.
+
+Q: What is LangGraph and why did you use it instead of a simple loop?
+A: LangGraph is a graph-based orchestration framework for multi-step AI workflows.
+   I used it because:
+   1. It provides explicit, typed shared state (AgentState TypedDict) shared
+      across all nodes without passing arguments manually.
+   2. It supports conditional edges — after executor runs, it decides dynamically
+      whether to go to "debugger" or END based on runtime state.
+   3. It supports cycles — the debugger→executor loop cannot be expressed in a
+      linear pipeline. LangGraph handles this natively.
+   4. It separates concerns: each node has one job, making the code easy to test
+      and extend.
+
+Q: How does LangGraph state management work?
+A: LangGraph defines a shared state as a TypedDict. Each node receives the complete
+   state and returns a partial dict with only the keys it changed. LangGraph merges
+   the update back into the shared state before calling the next node. This makes
+   every node's side effects explicit and traceable.
+
+Q: Explain the routing mechanism in your LangGraph graph.
+A: I use conditional edges via graph.add_conditional_edges(node, route_next).
+   route_next() is a function that reads state["current_step"] and returns the
+   name of the next node (or END). Every node sets current_step to indicate what
+   should run next. All five nodes share the same routing function. This means
+   the "control flow" of the agent is encoded in a single state field, making it
+   easy to debug and extend.
+
+Q: How do you prevent the agent from running indefinitely?
+A: The debugger node increments state["iteration"] at the start of each call and
+   checks if it exceeds state["max_iterations"] (default: 5). If the limit is
+   reached, it returns current_step = "done" with status = "max_iterations_reached",
+   which causes route_next() to return END and stop the graph.
+
+Q: How do the LLM prompts ensure structured output?
+A: Each prompt explicitly instructs the LLM: "Respond ONLY with the JSON object,
+   no markdown fences or extra text." The JSON schema is included in the prompt
+   with field names, types, and examples. The _parse_json_response() function
+   handles the case where the LLM wraps output in ```json ... ``` code fences
+   by stripping the fences before calling json.loads().
+
+Q: What is LangChain and how is it used here?
+A: LangChain is a framework that provides a unified interface for calling LLMs,
+   defining tools, and building chains. In this project I use:
+   - langchain_openai.ChatOpenAI as the LLM class (abstracting OpenAI's API)
+   - langchain_core.tools.@tool to define callable tools for the agent
+   - llm.invoke(prompt) to make synchronous LLM calls
+   The main benefit is that if I wanted to switch to a different LLM provider,
+   I would only change the create_llm() function in llm.py.
+
+Q: How is security enforced when running shell commands?
+A: Two layers:
+   1. Blocklist: substring patterns like "rm -rf /", "sudo", "curl | bash" are
+      rejected immediately before any parsing.
+   2. Allowlist: after parsing with shlex.split(), the base command must be in
+      ALLOWED_COMMANDS (python, pip, pytest, git, npm, etc.). Any other command
+      is rejected. This means the AI cannot execute arbitrary system commands
+      even if it generates malicious output.
+
+Q: How do you prevent the AI from writing files outside the project workspace?
+A: Every file operation goes through validate_path_in_workspace() in workspace.py.
+   It resolves the full path (handling ../../ traversal) and checks that it starts
+   with the workspace's resolved path. If not, it raises a ValueError. This means
+   even if the LLM generates a file path like "../../etc/passwd", the write is
+   rejected.
+
+Q: How does the debugger know what to fix?
+A: The debug prompt includes: (1) all current file contents, (2) the command that
+   failed, (3) the exit code, (4) the full error output, and (5) a list of
+   previous fix attempts. The LLM returns a JSON object with root_cause, a list
+   of fixes (file + full corrected content), and optional additional_commands
+   (e.g., pip install). The agent applies each fix via apply_patch_to_file()
+   and then hands control back to the executor to re-run tests.
+
+Q: What is Typer and how does it work?
+A: Typer is a Python CLI framework that uses function type annotations to auto-
+   generate argument parsers. You decorate a function with @app.command() and
+   its parameters become CLI arguments/options based on their type annotation.
+   typer.Argument() creates positional args, typer.Option() creates flags.
+   It provides built-in help text, type validation, and shell completion.
+
+Q: What is Rich and what does it provide?
+A: Rich is a terminal UI library. It provides: colored markup ([bold red]), tables
+   (Rich Table with box styles), panels (for banners), progress spinners, and
+   automatic ANSI code handling. It detects if stdout is a TTY and disables
+   colors when piped to a file. In this project it's used for the banner, all
+   step/success/error messages, status tables, and plan tables.
+
+Q: How does the project handle persistent state between sessions?
+A: Each project has a .aicode/state.json file in its workspace. The state module
+   provides init_state(), load_state(), save_state(), and helper functions to
+   append to command_history, errors, and patches lists. The CLI reads this at
+   the start of debug/status commands and writes it back after graph execution.
+   This lets you inspect past runs, resume debugging, and view what the agent did.
+
+Q: How does diff/patch work in this system?
+A: When the generator or debugger writes a new version of a file, apply_patch_to_file()
+   reads the existing content, generates a unified diff using Python's built-in
+   difflib.unified_diff(), writes the new content, and returns the diff string.
+   show_diff_summary() counts "+"/"-" lines to produce a human-readable summary.
+   The full diff is also stored in state.json's patches list for auditability.
+
+Q: What OpenAI model does this use and why?
+A: Default is gpt-4o-mini. It's the best price/performance ratio for code generation
+   tasks — fast, cheap, and capable of generating syntactically correct Python and
+   JavaScript. The model is configurable via AICODE_MODEL environment variable, so
+   users can upgrade to gpt-4o for harder debugging tasks.
+
+Q: How does the aicode debug command differ from aicode build?
+A: aicode build starts the graph from the planner node and goes through the full
+   pipeline. aicode debug starts the graph with current_step="debug", bypassing
+   the planner, scaffolder, and generator nodes entirely. It loads the existing
+   files from disk, runs the command to capture the current error, then enters
+   the debugger→executor loop. This allows debugging projects that weren't built
+   by AICode, or retrying a previously failed build.
+
+================================================================================
+24. GLOSSARY
+================================================================================
+
+  Term                Definition
+  ----                ----------
+  Agent               An AI system that perceives, decides, acts, and iterates
+  AgentState          TypedDict holding all shared state in the LangGraph graph
+  Agentic loop        The debug→execute→debug cycle that runs until convergence
+  Conditional edge    A LangGraph edge where the next node is chosen dynamically
+  current_step        State field used as routing control: "scaffold","generate", etc.
+  Diff / Patch        Unified diff format showing line-level changes between versions
+  END                 LangGraph sentinel: stops the graph
+  Entry point         First node LangGraph executes: "planner"
+  LangChain           LLM abstraction framework (prompts, tools, model adapters)
+  LangGraph           Graph-based agent orchestration built on LangChain
+  Node                A Python function registered in the LangGraph StateGraph
+  OpenAI API          RESTful API for calling GPT models (gpt-4o-mini, gpt-4o, etc.)
+  Rich                Python library for beautiful terminal output
+  route_next()        The routing function: reads current_step, returns next node name
+  Sandbox             Workspace path enforcement preventing writes outside project dir
+  ShellResult         Dataclass capturing exit_code, stdout, stderr, timed_out
+  state.json          Persistent project state file at <workspace>/.aicode/state.json
+  StateGraph          LangGraph class: graph container with nodes, edges, state schema
+  Structured output   Prompting the LLM to return a specific JSON schema
+  Typer               CLI framework using Python type annotations for argument parsing
+  Unified diff        Standard format for showing file changes (used by git diff)
+  Workspace           Isolated project directory under aicode_workspace/<project_name>
+
+================================================================================
+END OF DOCUMENT
+================================================================================

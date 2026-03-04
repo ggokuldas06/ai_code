@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aicode-cli"
+version = "0.1.0"
+description = "Agentic CLI Coding Assistant - automatically build MVPs and debug codebases"
+requires-python = ">=3.10"
+dependencies = [
+    "typer[all]>=0.9.0",
+    "rich>=13.0",
+    "langgraph>=0.2.0",
+    "langchain>=0.3.0",
+    "langchain-openai>=0.1.0",
+]
+
+[project.scripts]
+aicode = "aicode.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["aicode*"]
