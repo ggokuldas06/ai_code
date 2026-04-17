@@ -10,5 +10,6 @@ def create_llm(config: AICodeConfig) -> ChatOpenAI:
     return ChatOpenAI(
         model=config.model_name,
         openai_api_key=config.openai_api_key,
+        openai_api_base=config.base_url,
         temperature=0.2,
     )
