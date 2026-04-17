@@ -371,3 +371,19 @@ def run_debug_agent(
 
     result = graph.invoke(initial_state)
     return result
+
+def security_agent(
+        state: dict | None = None
+)->dict:
+    """find out and clear security vulernabilities on the current code base"""
+    print_step("Scanning", "checking for security vulnerability...")
+    config = AICodeConfig(**state["config"])
+    from pathlib import Path
+    llm = create_llm(config)
+    workspace = Path(state["workspace"])
+    prompt = PLAN_PROMPT.format(files=workspace)
+    response = llm.invoke(prompt)
+    plan = _parse_json_response(response.content)
+
+    print_success(f"Plan created: {plan['vulnerabilities']}, level {plan['level']}, fixes {plan['fixes']}")
+    return {"plan": plan}

@@ -80,3 +80,21 @@ Analyze the root cause and provide a fix. Respond with a JSON object:
 }}
 
 Respond ONLY with the JSON object, no markdown fences or extra text."""
+
+FINAL_PROMPT= """ you are an security expert. go through the full code and find any possible security vulnerabilities
+Project Files:
+{files}
+
+Analyze the complete code base and suggest possible security vulenerabilites respond with a JSON object:
+{{
+  "vulnerability" : "security issue found",
+  "level" : "the level of threat",
+  "fixes": [
+    {{
+      "file": "path/to/file.py",
+      "content": "entire corrected file content"
+    }}
+  ],
+  "additional_commands": ["pip install missing-package"]
+}}
+"""

@@ -147,7 +147,7 @@ The system is divided into three major layers:
   │                    generate/debug)                          │
   │   tools.py       — LangChain @tool definitions              │
   │   shell.py       — subprocess execution with timeout        │
-  │   security.py    — command allowlist + blocked patterns      │
+  │   security.py    — command allowlist + blocked patterns     │
   │   filesystem.py  — sandboxed file read/write/list           │
   │   workspace.py   — path management & path traversal guard   │
   │   diff_patch.py  — unified diff generation & patch apply    │
