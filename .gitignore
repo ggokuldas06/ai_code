@@ -42,5 +42,6 @@ htmlcov/
 .pyright/
 
 # Local workspace outputs (optional)
+aicode_workspace.
 aicode_workspace/*/build/
 aicode_workspace/*/dist/
